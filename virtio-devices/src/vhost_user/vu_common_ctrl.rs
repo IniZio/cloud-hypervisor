@@ -50,6 +50,8 @@ pub struct VhostUserConfig {
 struct VringInfo {
     config_data: VringConfigData,
     used_guest_addr: u64,
+    call: Option<Arc<EventFd>>,
+    kick: Arc<EventFd>,
 }
 
 #[derive(Clone)]
@@ -62,6 +64,8 @@ pub struct VhostUserHandle {
     acked_features: u64,
     vrings_info: Option<Vec<VringInfo>>,
     queue_indexes: Vec<usize>,
+    // Bases of the rings save_backend_state stopped, restarted on resume.
+    stopped_vring_bases: Option<Vec<u64>>,
 }
 
 impl VhostUserHandle {
@@ -250,9 +254,15 @@ impl VhostUserHandle {
                 log_addr: None,
             };
 
+            let call = virtio_interrupt
+                .notifier(VirtioInterruptType::Queue(*queue_index as u16))
+                .map(Arc::new);
+            let kick = Arc::new(queue_evt.try_clone().map_err(Error::CloneQueueEventFd)?);
             vrings_info.push(VringInfo {
                 config_data,
                 used_guest_addr: queue.used_ring(),
+                call: call.clone(),
+                kick,
             });
 
             self.vu
@@ -270,9 +280,7 @@ impl VhostUserHandle {
                 .set_vring_base(*queue_index, base)
                 .map_err(Error::VhostUserSetVringBase)?;
 
-            if let Some(eventfd) =
-                virtio_interrupt.notifier(VirtioInterruptType::Queue(*queue_index as u16))
-            {
+            if let Some(eventfd) = call {
                 self.vu
                     .set_vring_call(*queue_index, &eventfd)
                     .map_err(Error::VhostUserSetVringCall)?;
@@ -294,6 +302,7 @@ impl VhostUserHandle {
         }
 
         self.vrings_info = Some(vrings_info);
+        self.stopped_vring_bases = None;
         self.ready = true;
 
         Ok(())
@@ -402,6 +411,7 @@ impl VhostUserHandle {
                 acked_features: 0,
                 vrings_info: None,
                 queue_indexes: Vec::new(),
+                stopped_vring_bases: None,
             })
         } else {
             const RETRY_INTERVAL: Duration = Duration::from_millis(100);
@@ -452,6 +462,7 @@ impl VhostUserHandle {
                             acked_features: 0,
                             vrings_info: None,
                             queue_indexes: Vec::new(),
+                            stopped_vring_bases: None,
                         });
                     }
                     Err(e) => e,
@@ -504,10 +515,39 @@ impl VhostUserHandle {
     }
 
     pub fn resume_vhost_user(&mut self) -> Result<()> {
+        if let Some(bases) = self.stopped_vring_bases.take() {
+            self.restart_vrings(&bases)?;
+        }
         if self.ready {
             self.enable_vhost_user_vrings(self.queue_indexes.clone(), true)?;
         }
 
+        Ok(())
+    }
+
+    /// Starts the rings again at `bases` after GET_VRING_BASE stopped them,
+    /// sending what setup_vhost_user sends for a restored device.
+    fn restart_vrings(&mut self, bases: &[u64]) -> Result<()> {
+        let Some(vrings_info) = &self.vrings_info else {
+            return Ok(());
+        };
+        for ((queue_index, vring), base) in self.queue_indexes.iter().zip(vrings_info).zip(bases) {
+            self.vu
+                .set_vring_addr(*queue_index, &vring.config_data)
+                .map_err(Error::VhostUserSetVringAddr)?;
+            self.vu
+                .set_vring_base(*queue_index, *base as u16)
+                .map_err(Error::VhostUserSetVringBase)?;
+            if let Some(call) = &vring.call {
+                self.vu
+                    .set_vring_call(*queue_index, call)
+                    .map_err(Error::VhostUserSetVringCall)?;
+            }
+            self.vu
+                .set_vring_kick(*queue_index, &vring.kick)
+                .map_err(Error::VhostUserSetVringKick)?;
+        }
+        self.ready = true;
         Ok(())
     }
 
@@ -537,6 +577,7 @@ impl VhostUserHandle {
 
         // The backend considers the vrings stopped after GET_VRING_BASE.
         self.ready = false;
+        self.stopped_vring_bases = Some(vring_bases.clone());
 
         let (local, remote) = UnixStream::pair().map_err(Error::SaveRestoreBackendState)?;
 

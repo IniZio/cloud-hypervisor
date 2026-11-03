@@ -60,6 +60,8 @@ pub enum Error {
     CreateKillEventFd(#[source] io::Error),
     #[error("Cloning kill eventfd failed")]
     CloneKillEventFd(#[source] io::Error),
+    #[error("Cloning queue eventfd failed")]
+    CloneQueueEventFd(#[source] io::Error),
     #[error("Invalid descriptor table address")]
     DescriptorTableAddress,
     #[error("Signal used queue failed")]
